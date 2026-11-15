@@ -115,6 +115,52 @@ def _parse_git_source(
     return url, ref, subdirectory, cache_path
 
 
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _is_commit_sha(ref: str) -> bool:
+    """True when ``ref`` is a full commit id (SHA-1: 40 hex, SHA-256: 64 hex).
+
+    ``git clone --branch`` only accepts branch and tag names, so a source
+    pinned to a commit (``...@<sha>``) needs a different fetch strategy.
+    Abbreviated ids are deliberately NOT matched: servers will not serve a
+    fetch for an abbreviated id, and a short hex string may be a real branch
+    or tag name, which ``--branch`` handles.
+    """
+    return len(ref) in (40, 64) and all(c in _HEX_DIGITS for c in ref)
+
+
+def _clone_commands(url: str, ref: str, dest: Path) -> list[list[str]]:
+    """The git commands that materialise ``url`` at ``ref`` into ``dest``.
+
+    Branches and tags: one shallow ``git clone --branch``.
+
+    Commit SHAs: ``--branch`` rejects them ("Remote branch <sha> not found in
+    upstream origin") even when the commit exists, so initialise an empty repo,
+    shallow-fetch exactly that commit (GitHub, GitLab and Azure DevOps all
+    allow fetching any reachable commit by id), and check it out detached.
+    """
+    if not _is_commit_sha(ref):
+        return [["git", "clone", "--depth", "1", "--branch", ref, url, str(dest)]]
+    d = str(dest)
+    return [
+        ["git", "init", "--quiet", d],
+        ["git", "-C", d, "remote", "add", "origin", url],
+        ["git", "-C", d, "fetch", "--depth", "1", "--quiet", "origin", ref],
+        [
+            "git",
+            "-C",
+            d,
+            "-c",
+            "advice.detachedHead=false",
+            "checkout",
+            "--quiet",
+            "--detach",
+            "FETCH_HEAD",
+        ],
+    ]
+
+
 def is_remote_source(source: str) -> bool:
     """Check if a source string is a secure remote URL (git+https://, https://).
 
@@ -320,16 +366,7 @@ async def _resolve_remote_source(source: str, cache_dir: Path) -> Path | None:
             rmtree_robust(tmp_path)
 
         try:
-            cmd = [
-                "git",
-                "clone",
-                "--depth",
-                "1",
-                "--branch",
-                ref,
-                url,
-                str(tmp_path),
-            ]
+            commands = _clone_commands(url, ref, tmp_path)
             logger.info(f"Cloning skill source: {url}@{ref}")
             # A clone issued from inside the REPL must never PROMPT. When the
             # remote demands credentials, git opens /dev/tty BY PATH -- not the
@@ -343,14 +380,14 @@ async def _resolve_remote_source(source: str, cache_dir: Path) -> Path | None:
             # helpers, tokens embedded in the URL and GH_TOKEN-style auth are
             # unaffected: only INTERACTIVE prompting is disabled.
             env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
-            result = _run_clone(cmd, env=env, timeout=120)
-
-            if result.returncode != 0:
-                logger.error(f"Git clone failed: {result.stderr}")
-                # Clean up partial clone
-                if tmp_path.exists():
-                    rmtree_robust(tmp_path, ignore_errors=True)
-                return None
+            for cmd in commands:
+                result = _run_clone(cmd, env=env, timeout=120)
+                if result.returncode != 0:
+                    logger.error(f"Git clone failed: {result.stderr}")
+                    # Clean up partial clone
+                    if tmp_path.exists():
+                        rmtree_robust(tmp_path, ignore_errors=True)
+                    return None
 
             # Write cache metadata to the temp dir (still not visible at cache_path)
             _sha_result = await asyncio.create_subprocess_exec(
