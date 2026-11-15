@@ -311,16 +311,33 @@ def discover_skills(skills_dir: Path) -> dict[str, SkillMetadata]:
     repo_root = _find_repo_root(skills_dir)
     boundary = repo_root if repo_root is not None else base_resolved
 
+    boundary_kind = "repository" if repo_root else "skill directory"
     skill_files = []
-    for root, _dirs, files in os.walk(skills_dir, followlinks=True):
+    for root, dirs, files in os.walk(skills_dir, followlinks=True):
         root_resolved = Path(root).resolve()
         if not root_resolved.is_relative_to(boundary):
-            logger.warning(
-                f"Skipping symlink that escapes "
-                f"{'repository' if repo_root else 'skill directory'} boundary: "
-                f"{root} (resolves to {root_resolved}, outside {boundary})"
-            )
+            # Defense in depth: escaping children are pruned below, so this
+            # should only trigger if the tree changes mid-walk.
+            dirs[:] = []
             continue
+        # Prune subdirectories that resolve outside the boundary *before*
+        # os.walk descends into them. Without pruning, a single escaping
+        # symlink yields one rejection per descendant directory (e.g. every
+        # .git/objects/* entry of a symlinked dev checkout).
+        kept = []
+        for d in dirs:
+            child = Path(root) / d
+            child_resolved = child.resolve()
+            if child_resolved.is_relative_to(boundary):
+                kept.append(d)
+                continue
+            logger.warning(
+                f"Skipping symlink that escapes {boundary_kind} boundary: "
+                f"{child} (resolves to {child_resolved}, outside {boundary}). "
+                f"Skills behind it are not loaded; to load them, add "
+                f"{child_resolved} as a skill source or copy it into {boundary}."
+            )
+        dirs[:] = kept
         if "SKILL.md" in files:
             skill_files.append(Path(root) / "SKILL.md")
     for skill_file in skill_files:

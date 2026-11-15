@@ -184,6 +184,99 @@ def test_symlink_outside_boundary_is_skipped(tmp_path: Path):
     )
 
 
+def _boundary_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if "escapes" in r.getMessage() and "boundary" in r.getMessage()
+    ]
+
+
+def test_escaping_symlink_is_pruned_and_logged_once(tmp_path: Path, caplog):
+    """An escaping symlink is rejected once; os.walk must not descend into it.
+
+    Regression: a symlinked dev checkout (skills/my-skill -> ~/dev/my-skill)
+    produced one warning per descendant directory (.git/objects/*,
+    __pycache__, ...) because rejected roots were not pruned from os.walk.
+    """
+    skills_base = tmp_path / "skills"
+    skills_base.mkdir()
+    legit = skills_base / "legit-skill"
+    legit.mkdir()
+    (legit / "SKILL.md").write_text(
+        "---\nname: legit-skill\ndescription: A legitimate skill\n---\nBody\n"
+    )
+
+    # Outside checkout with a skill and many nested subdirectories.
+    checkout = tmp_path / "dev" / "my-skill"
+    checkout.mkdir(parents=True)
+    (checkout / "SKILL.md").write_text(
+        "---\nname: my-skill\ndescription: Outside skill\n---\nBody\n"
+    )
+    for i in range(20):
+        (checkout / ".git" / "objects" / f"{i:02x}").mkdir(parents=True)
+    (checkout / "__pycache__").mkdir()
+    (checkout / ".ruff_cache" / "0.1").mkdir(parents=True)
+    nested = checkout / "sub" / "nested-skill"
+    nested.mkdir(parents=True)
+    (nested / "SKILL.md").write_text(
+        "---\nname: nested-skill\ndescription: Outside nested\n---\nBody\n"
+    )
+
+    link = skills_base / "my-skill"
+    os.symlink(checkout, link)
+
+    with caplog.at_level("DEBUG", logger="amplifier_module_tool_skills.discovery"):
+        skills = discover_skills(skills_base)
+
+    assert "legit-skill" in skills
+    assert "my-skill" not in skills
+    assert "nested-skill" not in skills
+
+    warnings = _boundary_warnings(caplog)
+    assert len(warnings) == 1, warnings
+    assert str(link) in warnings[0]
+    assert str(checkout.resolve()) in warnings[0]
+
+
+def test_nested_escaping_symlink_is_pruned(tmp_path: Path, caplog):
+    """An escaping symlink deep inside the tree is pruned without descending."""
+    skills_base = tmp_path / "skills"
+    inner = skills_base / "group" / "inner-skill"
+    inner.mkdir(parents=True)
+    (inner / "SKILL.md").write_text("---\nname: inner-skill\ndescription: Inside\n---\nBody\n")
+
+    outside = tmp_path / "outside"
+    for i in range(5):
+        (outside / f"d{i}" / "deeper").mkdir(parents=True)
+    (outside / "SKILL.md").write_text(
+        "---\nname: outside\ndescription: Should not load\n---\nBody\n"
+    )
+    os.symlink(outside, skills_base / "group" / "escape")
+
+    with caplog.at_level("DEBUG", logger="amplifier_module_tool_skills.discovery"):
+        skills = discover_skills(skills_base)
+
+    assert "inner-skill" in skills
+    assert "outside" not in skills
+    assert len(_boundary_warnings(caplog)) == 1
+
+
+def test_internal_symlink_is_still_followed_without_warning(tmp_path: Path, caplog):
+    """Symlinks resolving inside the boundary are traversed and not logged."""
+    skills_base = tmp_path / "skills"
+    real = skills_base / "real" / "linked-skill"
+    real.mkdir(parents=True)
+    (real / "SKILL.md").write_text("---\nname: linked-skill\ndescription: Inside\n---\nBody\n")
+    os.symlink(skills_base / "real", skills_base / "alias")
+
+    with caplog.at_level("DEBUG", logger="amplifier_module_tool_skills.discovery"):
+        skills = discover_skills(skills_base)
+
+    assert "linked-skill" in skills
+    assert _boundary_warnings(caplog) == []
+
+
 # ---------------------------------------------------------------------------
 # Tests for git-repo-root boundary (fixes #160)
 # ---------------------------------------------------------------------------
